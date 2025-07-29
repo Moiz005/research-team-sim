@@ -22,7 +22,7 @@ class AgentState(TypedDict):
     reader_output: Dict[str, Any]
     error: str
 
-def fetcher_agent(state: Dict[str, Any]) -> Dict[str, Any]:
+def fetcher_agent(state: AgentState) -> AgentState:
     """Fetcher agent to retrieve paper metadata and PDF from ArXiv API."""
     arxiv_id = state['arxiv_id']
     paper_id = state['paper_id']
@@ -49,7 +49,7 @@ def fetcher_agent(state: Dict[str, Any]) -> Dict[str, Any]:
 
         if not os.path.exists(pdf_path) or os.path.getsize(pdf_path) < 1000:
             logging.error(f"Invalid or empty PDF for {arxiv_id}")
-            return {"paper_id": paper_id, "error": "Failed to download valid PDF"}
+            return {**state, "error": "Failed to download valid PDF"}
         
         fetcher_output = {
             "paper_id": paper_id,
@@ -58,7 +58,7 @@ def fetcher_agent(state: Dict[str, Any]) -> Dict[str, Any]:
             "metadata": metadata
         }
 
-        redis_client.set(f"paper/{paper_id}", json.dumps(fetcher_output))
+        redis_client.set(f"paper:{paper_id}", json.dumps(fetcher_output))
 
         logging.info(f"Fetched {arxiv_id}, stored as paper:{paper_id}")
 
@@ -66,4 +66,49 @@ def fetcher_agent(state: Dict[str, Any]) -> Dict[str, Any]:
 
     except Exception as e:
         logging.error(f"Error fetching {arxiv_id}: {str(e)}")
+        return {**state, "error": str(e)}
+
+def reader_agent(state: AgentState) -> AgentState:
+    """Reader agent to process PDF and extract text/metadata."""
+    fetcher_output = state['fetcher_output']
+    paper_id = state['paper_id']
+
+    if state['error']:
+        logging.error(f"Error in fetcher : {state['error']}")
+        return {**state, "error": state['error']}
+    
+    pdf_path = state['fetcher_output']['pdf_path']
+    if not pdf_path or os.path.exists(pdf_path):
+        logging.error(f"Invalif pdf path for {paper_id}")
+        return {**state, "error": f"Invalif pdf path for {paper_id}"}
+    
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            full_text = ""
+            for page in pdf.pages:
+                text = page.extract_text()
+                if text:
+                    full_text += text + "\n"
+            
+        if len(full_text) < 100:  # Arbitrary threshold
+            logging.warning(f"Poor text extraction for {paper_id}")
+            # TODO: Add PyMuPDF or OCR fallback
+            return {**state, "error": "Insufficient text extracted"}
+        
+        reader_output = {
+            "paper_id": paper_id,
+            "text": full_text,
+            "metadata": fetcher_output['metadata']
+        }
+
+        redis_data = json.loads(redis_client.get(f"paper:{paper_id}") or "{}")
+        redis_data.update({"reader_output": reader_output})
+        redis_client.set(f"paper:{paper_id}", json.dumps(redis_data))
+
+        logging.info(f"Processed {paper_id}, text length: {len(full_text)}")
+
+        return {**state, "reader_output": reader_output}
+    
+    except Exception as e:
+        logging.error(f"Error processing {pdf_path}: {str(e)}")
         return {**state, "error": str(e)}
