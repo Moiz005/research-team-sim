@@ -7,11 +7,12 @@ import os
 import json
 import arxiv
 from typing import TypedDict
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sentence_transformers import SentenceTransformer
+import re
 
-# Set up logging
 logging.basicConfig(filename='reader.log', level=logging.INFO)
 
-# Redis connection
 redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
 
 
@@ -20,7 +21,15 @@ class AgentState(TypedDict):
     arxiv_id: str
     fetcher_output: Dict[str, Any]
     reader_output: Dict[str, Any]
+    analyst_output: Dict[str, Any]
     error: str
+
+jargon_glossary = {
+    "atrous convolution": "a method using spaced-out filters for larger receptive fields",
+    "semantic segmentation": "assigning a class label to each pixel in an image",
+    "fully connected crf": "a model using conditional random fields to refine segmentation",
+    "deep convolutional nets": "neural networks with multiple convolutional layers for feature extraction"
+}
 
 def fetcher_agent(state: AgentState) -> AgentState:
     """Fetcher agent to retrieve paper metadata and PDF from ArXiv API."""
@@ -90,7 +99,7 @@ def reader_agent(state: AgentState) -> AgentState:
                 if text:
                     full_text += text + "\n"
             
-        if len(full_text) < 100:  # Arbitrary threshold
+        if len(full_text) < 100:
             logging.warning(f"Poor text extraction for {paper_id}")
             # TODO: Add PyMuPDF or OCR fallback
             return {**state, "error": "Insufficient text extracted"}
@@ -113,13 +122,62 @@ def reader_agent(state: AgentState) -> AgentState:
         logging.error(f"Error processing {pdf_path}: {str(e)}")
         return {**state, "error": str(e)}
 
+
+def analyst_agent(state: AgentState) -> AgentState:
+    """Analyst agent to extract keywords and handle jargon."""
+    reader_output = state["reader_output"]
+    paper_id = state["paper_id"]
+    if state['error']:
+        logging.error(f"Error in analyst : {state['error']}")
+        return {**state, "error": state['error']}
+
+    text = reader_output['text']
+    if not text:
+        logging.error(f"No text available for {paper_id}")
+        return {**state, "error": "No text available"}
+    
+    try:
+        model = SentenceTransformer('all-MiniLM-L6-v2')
+        vectorizer = TfidfVectorizer(max_features=10, stop_words='english')
+        tfidf_matrix = vectorizer.fit_transform([text])
+        keywords = vectorizer.get_feature_names_out().tolist()
+
+        enriched_keywords = []
+        for keyword in keywords:
+            keyword_clean = keyword.lower().strip()
+            explanation = jargon_glossary.get(keyword_clean, "no explanation available")
+            enriched_keywords.append({
+                "keyword": keyword,
+                "explanation": explanation
+            })
+
+        analyst_output = {
+            "paper_id": paper_id,
+            "keywords": enriched_keywords,
+            "keyword_embeddings": model.encode([kw["keyword"] for kw in enriched_keywords]).tolist()
+        }
+
+        redis_data = json.loads(redis_client.get(f"paper:{paper_id}"))
+        redis_data.update("analyst_output", analyst_output)
+        redis_client.set(f"paper:{paper_id}", json.dumps(redis_data))
+
+        logging.info(f"Analyzed {paper_id}, keywords: {len(enriched_keywords)}")
+
+        return {**state, "analyst_output": analyst_output}
+    
+    except Exception as e:
+        logging.error(f"Error analyzing {paper_id}: {str(e)}")
+        return {**state, "error": str(e)}
+
 graph = StateGraph(AgentState)
 
 graph.add_node("fetcher", fetcher_agent)
 graph.add_node("reader", reader_agent)
+graph.add_node("analyst", analyst_agent)
 graph.set_entry_point("fetcher")
 graph.add_edge("fetcher", "reader")
-graph.add_edge("reader", END)
+graph.add_edge("reader", "analyst")
+graph.add_edge("analyst", END)
 
 app = graph.compile()
 
@@ -128,8 +186,9 @@ inputs = AgentState(
     arxiv_id="1606.00915",
     fetcher_output={},
     reader_output={},
+    analyst_output={},
     error=""
 )
 response = app.invoke(inputs)
 
-print(response["reader_output"]["text"])
+print(json.dumps(response["analust_output"]["keywords"]))
