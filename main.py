@@ -4,7 +4,7 @@ from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AI
 import pdfplumber
 import redis
 from langgraph.graph import StateGraph, END
-from typing import Dict, Any
+from typing import Dict, Any, List
 import logging
 import os
 import json
@@ -250,7 +250,7 @@ def summarizer_agent(state: AgentState) -> AgentState:
         }
 
         redis_data = json.loads(redis_client.get(f"paper:{paper_id}") or "{}")
-        redis_data.update("summarizer_output", json.dumps(redis_data))
+        redis_data.update("summarizer_output", summarizer_output)
         redis_client.set(f"paper:{paper_id}", json.dumps(redis_data))
 
         logging.info(f"Summarized {paper_id}, summary length: {len(summary)} chars")
@@ -260,6 +260,26 @@ def summarizer_agent(state: AgentState) -> AgentState:
     except Exception as e:
         logging.error(f"Error summarizing {paper_id}: {str(e)}")
         return {**state, "error": str(e)}
+
+
+def process_multiple_papers(arxiv_ids: List[str]) -> List[Dict]:
+    """Process multiple papers in sequence."""
+    results = []
+    for arxiv_id in arxiv_ids:
+        paper_id = f"paper_{arxiv_id.replace('.', '_')}"
+        initial_state: AgentState = {
+            "paper_id": paper_id,
+            "arxiv_id": arxiv_id,
+            "fetcher_output": {},
+            "reader_output": {},
+            "analyst_output": {},
+            "summarizer_output": {},
+            "error": ""
+        }
+        result = app.invoke(initial_state)
+        results.append(result["summarizer_output"]["summary"])
+        logging.info(f"Completed processing for arXiv ID: {arxiv_id}")
+    return results
 
 graph = StateGraph(AgentState)
 
@@ -275,15 +295,8 @@ graph.add_edge("summarizer", END)
 
 app = graph.compile()
 
-inputs = AgentState(
-    paper_id="deeplab_2016",
-    arxiv_id="1606.00915",
-    fetcher_output={},
-    reader_output={},
-    analyst_output={},
-    summarizer_output={},
-    error=""
-)
-response = app.invoke(inputs)
-
-print(response["summarizer_output"]["summary"])
+if __name__ == "__main__":
+    arxiv_ids = ["1606.00915", "1706.05587"]
+    results = process_multiple_papers(arxiv_ids)
+    for result in results:
+        print(result)
