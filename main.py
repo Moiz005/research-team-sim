@@ -191,20 +191,21 @@ def analyst_agent(state: AgentState) -> AgentState:
         keywords = vectorizer.get_feature_names_out().tolist()
 
         enriched_keywords = []
-        for keyword in keywords:
+        keyword_embeddings = embedder.encode(keywords, show_progress_bar=False).tolist()
+        for keyword, embedding in zip(keywords, keyword_embeddings):
             keyword_clean = keyword.lower().strip()
             explanation = llm_jargon_explanation(keyword_clean)
             if len(explanation) > 100 or explanation == "no explanation available":
                 explanation = "no clear explanation available"
             enriched_keywords.append({
                 "keyword": keyword,
-                "explanation": explanation
+                "explanation": explanation,
+                "embedding": embedding
             })
 
         analyst_output = {
             "paper_id": paper_id,
-            "keywords": enriched_keywords,
-            "keyword_embeddings": embedder.encode([kw["keyword"] for kw in enriched_keywords]).tolist()
+            "keywords": enriched_keywords
         }
 
         redis_data = json.loads(redis_client.get(f"paper:{paper_id}"))
@@ -243,10 +244,13 @@ def summarizer_agent(state: AgentState) -> AgentState:
         if len(summary) < 50 or len(summary) > 500:
             logging.warning(f"Invalid summary length for {paper_id}: {len(summary)} chars")
             summary = "Summary generation failed: invalid length"
+        
+        summary_embedding = embedder.encode([summary], show_progress_bar=False).tolist()[0]
 
         summarizer_output = {
             "paper_id": paper_id,
-            "summary": summary
+            "summary": summary,
+            "summary_embedding": summary_embedding
         }
 
         redis_data = json.loads(redis_client.get(f"paper:{paper_id}") or "{}")
