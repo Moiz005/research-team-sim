@@ -112,3 +112,24 @@ def reader_agent(state: AgentState) -> AgentState:
     except Exception as e:
         logging.error(f"Error processing {pdf_path}: {str(e)}")
         return {**state, "error": str(e)}
+
+graph = StateGraph(AgentState)
+
+graph.add_node("fetcher", fetcher_agent)
+graph.add_node("reader", reader_agent)
+graph.set_entry_point("fetcher")
+graph.add_edge("fetcher", "reader")
+graph.add_edge("reader", END)
+
+app = graph.compile()
+
+inputs = AgentState(
+    paper_id="deeplab_2016",
+    arxiv_id="1606.00915",
+    fetcher_output={},
+    reader_output={},
+    error=""
+)
+response = app.invoke(inputs)
+
+print(response["reader_output"]["text"])
