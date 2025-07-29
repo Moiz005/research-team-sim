@@ -15,7 +15,7 @@ from sentence_transformers import SentenceTransformer
 import re
 from dotenv import load_dotenv
 
-logging.basicConfig(filename='reader.log', level=logging.INFO)
+logging.basicConfig(filename='pipeline.log', level=logging.INFO)
 
 redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
 
