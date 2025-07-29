@@ -1,3 +1,4 @@
+from langchain_openai import ChatOpenAI
 import pdfplumber
 import redis
 from langgraph.graph import StateGraph, END
@@ -15,6 +16,7 @@ logging.basicConfig(filename='reader.log', level=logging.INFO)
 
 redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
 
+embedder = SentenceTransformer('all-MiniLM-L6-v2')
 
 class AgentState(TypedDict):
     paper_id: str
@@ -30,6 +32,16 @@ jargon_glossary = {
     "fully connected crf": "a model using conditional random fields to refine segmentation",
     "deep convolutional nets": "neural networks with multiple convolutional layers for feature extraction"
 }
+
+def llm_jargon_explanation(keyword: str) -> str:
+    """Using LLM to generate concise jargon explanations."""
+    LLM_PROMPT = f"""
+    Given a technical term from an academic paper, provide a concise explanation (20-50 words) suitable for a general audience. Focus on clarity and brevity, avoiding excessive technical detail. Return the explanation only, no additional text.
+
+    Term: {keyword}
+    """
+    llm = ChatOpenAI(model="gpt-4o-mini")
+    return llm.invoke(LLM_PROMPT)
 
 def fetcher_agent(state: AgentState) -> AgentState:
     """Fetcher agent to retrieve paper metadata and PDF from ArXiv API."""
@@ -137,7 +149,6 @@ def analyst_agent(state: AgentState) -> AgentState:
         return {**state, "error": "No text available"}
     
     try:
-        model = SentenceTransformer('all-MiniLM-L6-v2')
         vectorizer = TfidfVectorizer(max_features=10, stop_words='english')
         tfidf_matrix = vectorizer.fit_transform([text])
         keywords = vectorizer.get_feature_names_out().tolist()
@@ -145,7 +156,9 @@ def analyst_agent(state: AgentState) -> AgentState:
         enriched_keywords = []
         for keyword in keywords:
             keyword_clean = keyword.lower().strip()
-            explanation = jargon_glossary.get(keyword_clean, "no explanation available")
+            explanation = llm_jargon_explanation(keyword_clean)
+            if len(explanation) > 100 or explanation == "no explanation available":
+                explanation = "no clear explanation available"
             enriched_keywords.append({
                 "keyword": keyword,
                 "explanation": explanation
@@ -154,7 +167,7 @@ def analyst_agent(state: AgentState) -> AgentState:
         analyst_output = {
             "paper_id": paper_id,
             "keywords": enriched_keywords,
-            "keyword_embeddings": model.encode([kw["keyword"] for kw in enriched_keywords]).tolist()
+            "keyword_embeddings": embedder.encode([kw["keyword"] for kw in enriched_keywords]).tolist()
         }
 
         redis_data = json.loads(redis_client.get(f"paper:{paper_id}"))
