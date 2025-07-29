@@ -1,4 +1,6 @@
 from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage
 import pdfplumber
 import redis
 from langgraph.graph import StateGraph, END
@@ -11,6 +13,7 @@ from typing import TypedDict
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sentence_transformers import SentenceTransformer
 import re
+from dotenv import load_dotenv
 
 logging.basicConfig(filename='reader.log', level=logging.INFO)
 
@@ -18,12 +21,15 @@ redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=T
 
 embedder = SentenceTransformer('all-MiniLM-L6-v2')
 
+load_dotenv()
+os.environ["OPENAI_API_KEY"]=os.getenv("OPENAI_API_KEY")
 class AgentState(TypedDict):
     paper_id: str
     arxiv_id: str
     fetcher_output: Dict[str, Any]
     reader_output: Dict[str, Any]
     analyst_output: Dict[str, Any]
+    summarizer_output: Dict[str, Any]
     error: str
 
 jargon_glossary = {
@@ -33,6 +39,8 @@ jargon_glossary = {
     "deep convolutional nets": "neural networks with multiple convolutional layers for feature extraction"
 }
 
+llm = ChatOpenAI(model="gpt-4o-mini")
+
 def llm_jargon_explanation(keyword: str) -> str:
     """Using LLM to generate concise jargon explanations."""
     LLM_PROMPT = f"""
@@ -40,8 +48,37 @@ def llm_jargon_explanation(keyword: str) -> str:
 
     Term: {keyword}
     """
-    llm = ChatOpenAI(model="gpt-4o-mini")
     return llm.invoke(LLM_PROMPT)
+
+summarizer_prompt = ChatPromptTemplate([
+    SystemMessage(
+        content="""Summarize the following academic paper in 100-200 words for a general audience. Include the provided keywords with their explanations in parentheses. Focus on clarity, brevity, and key contributions. Use the paper's metadata for context.
+
+        Return the summary only, no additional text."""
+    ),
+    HumanMessage(
+        content=(
+            "Title: {title}\n"
+            "Abstract: {abstract}\n"
+            "Full Text: {text}\n"
+            "Keywords: {keywords}"
+        )
+    )
+])
+
+def llm_summary_generator(text: str, keywords: list, metadata: dict) -> str:
+    """Using LLM to generate a concise summary."""
+    summarizer_chain = summarizer_prompt | llm
+    
+    keyword_str = ", ".join([f"{kw['keyword']} ({kw['explanation']})" for kw in keywords])
+    response = summarizer_chain.invoke({
+        "title": metadata["title"],
+        "abstract": metadata["abstract"],
+        "text": text,
+        "keywords": keyword_str
+    })
+
+    return response.content
 
 def fetcher_agent(state: AgentState) -> AgentState:
     """Fetcher agent to retrieve paper metadata and PDF from ArXiv API."""
@@ -182,15 +219,59 @@ def analyst_agent(state: AgentState) -> AgentState:
         logging.error(f"Error analyzing {paper_id}: {str(e)}")
         return {**state, "error": str(e)}
 
+def summarizer_agent(state: AgentState) -> AgentState:
+    """Summarizer agent with LLM for dynamic summary generation."""
+    reader_output = state['reader_output']
+    analyst_output = state['analyst_output']
+    paper_id = state["paper_id"]
+
+    if state["error"]:
+        logging.error(f"Error Propagated: {state['error']}")
+        return {**state, "error": state["error"]}
+    
+    text = reader_output['text']
+    metadata = reader_output['metadata']
+    keywords = analyst_output['keywords']
+
+    if not text or not keywords:
+        logging.error(f"Missing text or keywords for {paper_id}")
+        return {**state, "error": "Missing text or keywords"}
+    
+    try:
+        summary = llm_summary_generator(text, keywords, metadata)
+
+        if len(summary) < 50 or len(summary) > 500:
+            logging.warning(f"Invalid summary length for {paper_id}: {len(summary)} chars")
+            summary = "Summary generation failed: invalid length"
+
+        summarizer_output = {
+            "paper_id": paper_id,
+            "summary": summary
+        }
+
+        redis_data = json.loads(redis_client.get(f"paper:{paper_id}") or "{}")
+        redis_data.update("summarizer_output", json.dumps(redis_data))
+        redis_client.set(f"paper:{paper_id}", json.dumps(redis_data))
+
+        logging.info(f"Summarized {paper_id}, summary length: {len(summary)} chars")
+
+        return {**state, "summarizer_output": summarizer_output}
+    
+    except Exception as e:
+        logging.error(f"Error summarizing {paper_id}: {str(e)}")
+        return {**state, "error": str(e)}
+
 graph = StateGraph(AgentState)
 
 graph.add_node("fetcher", fetcher_agent)
 graph.add_node("reader", reader_agent)
 graph.add_node("analyst", analyst_agent)
+graph.add_node("summarizer", summarizer_agent)
 graph.set_entry_point("fetcher")
 graph.add_edge("fetcher", "reader")
 graph.add_edge("reader", "analyst")
-graph.add_edge("analyst", END)
+graph.add_edge("analyst", "summarizer")
+graph.add_edge("summarizer", END)
 
 app = graph.compile()
 
@@ -200,8 +281,9 @@ inputs = AgentState(
     fetcher_output={},
     reader_output={},
     analyst_output={},
+    summarizer_output={},
     error=""
 )
 response = app.invoke(inputs)
 
-print(json.dumps(response["analust_output"]["keywords"]))
+print(response["summarizer_output"]["summary"])
