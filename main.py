@@ -71,6 +71,7 @@ def llm_summary_generator(text: str, keywords: list, metadata: dict) -> str:
     summarizer_chain = summarizer_prompt | llm
     
     keyword_str = ", ".join([f"{kw['keyword']} ({kw['explanation']})" for kw in keywords])
+    text = text[:1500]
     response = summarizer_chain.invoke({
         "title": metadata["title"],
         "abstract": metadata["abstract"],
