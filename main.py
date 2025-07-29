@@ -6,6 +6,7 @@ import logging
 import os
 import json
 import arxiv
+from typing import TypedDict
 
 # Set up logging
 logging.basicConfig(filename='reader.log', level=logging.INFO)
@@ -13,10 +14,18 @@ logging.basicConfig(filename='reader.log', level=logging.INFO)
 # Redis connection
 redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
 
+
+class AgentState(TypedDict):
+    paper_id: str
+    arxiv_id: str
+    fetcher_output: Dict[str, Any]
+    reader_output: Dict[str, Any]
+    error: str
+
 def fetcher_agent(state: Dict[str, Any]) -> Dict[str, Any]:
     """Fetcher agent to retrieve paper metadata and PDF from ArXiv API."""
-    arxiv_id = state.get("arxiv_id", "1606.00915")  # Default to DeepLab paper
-    paper_id = state.get("paper_id", "deeplab_2016")
+    arxiv_id = state['arxiv_id']
+    paper_id = state['paper_id']
 
     try:
         client = arxiv.Client(page_size=1, delay_seconds=3, num_retries=3)
@@ -42,19 +51,19 @@ def fetcher_agent(state: Dict[str, Any]) -> Dict[str, Any]:
             logging.error(f"Invalid or empty PDF for {arxiv_id}")
             return {"paper_id": paper_id, "error": "Failed to download valid PDF"}
         
-        output = {
+        fetcher_output = {
             "paper_id": paper_id,
             "arxiv_id": arxiv_id,
             "pdf_path": pdf_path,
             "metadata": metadata
         }
 
-        redis_client.set(f"paper/{paper_id}", json.dumps(output))
+        redis_client.set(f"paper/{paper_id}", json.dumps(fetcher_output))
 
         logging.info(f"Fetched {arxiv_id}, stored as paper:{paper_id}")
 
-        return {"paper_id": paper_id, "fetcher_output": output}
+        return {**state, "paper_id": paper_id, "fetcher_output": fetcher_output}
 
     except Exception as e:
         logging.error(f"Error fetching {arxiv_id}: {str(e)}")
-        return {"paper_id": paper_id, "error": str(e)}
+        return {**state, "error": str(e)}
