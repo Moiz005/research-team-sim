@@ -14,6 +14,9 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sentence_transformers import SentenceTransformer
 import re
 from dotenv import load_dotenv
+import numpy as np
+from scipy.spatial.distance import cosine
+import argparse
 
 logging.basicConfig(filename='pipeline.log', level=logging.INFO)
 
@@ -80,6 +83,40 @@ def llm_summary_generator(text: str, keywords: list, metadata: dict) -> str:
     })
 
     return response.content
+
+def similarity_search(query_embedding: List[float], paper_ids: List[str], embedding_type: str = "summary_embedding") -> List[Dict]:
+    """Perform similarity search on embeddings stored in Redis."""
+    results = []
+    query_vec = np.array(query_embedding)
+    
+    for paper_id in paper_ids:
+        try:
+            redis_data = json.loads(redis_client.get(f"paper:{paper_id}") or "{}")
+            summarizer_output = redis_data.get("summarizer_output", {})
+            target_embedding = summarizer_output.get(embedding_type, None)
+            
+            if target_embedding:
+                target_vec = np.array(target_embedding)
+                if len(target_vec) != len(query_vec):
+                    logging.warning(f"Invalid embedding dimension for {paper_id}: expected {len(query_vec)}, got {len(target_vec)}")
+                    continue
+                similarity = 1 - cosine(query_vec, target_vec)  # Cosine similarity
+                metadata = redis_data.get("reader_output", {}).get("metadata", {})
+                results.append({
+                    "paper_id": paper_id,
+                    "similarity": similarity,
+                    "summary": summarizer_output.get("summary", ""),
+                    "title": metadata.get("title", "Unknown"),
+                    "authors": metadata.get("authors", ["Unknown"])
+                })
+            else:
+                logging.warning(f"No {embedding_type} found for {paper_id}")
+        except Exception as e:
+            logging.error(f"Error in similarity search for {paper_id}: {str(e)}")
+    
+    # Sort by similarity (descending)
+    results.sort(key=lambda x: x["similarity"], reverse=True)
+    return results[:5]  # Return top-5 results
 
 def fetcher_agent(state: AgentState) -> AgentState:
     """Fetcher agent to retrieve paper metadata and PDF from ArXiv API."""
@@ -300,8 +337,32 @@ graph.add_edge("summarizer", END)
 
 app = graph.compile()
 
+def main():
+    parser = argparse.ArgumentParser(description="Research Team Simulator")
+    parser.add_argument("--arxiv-ids", nargs="+", default=["1606.00915"], help="List of arXiv IDs to process")
+    parser.add_argument("--task", choices=["process", "similarity"], default="process", help="Task to perform")
+    parser.add_argument("--query-id", help="Paper ID for similarity search (e.g., paper_1606_00915)")
+    args = parser.parse_args()
+    
+    if args.task == "process":
+        results = process_multiple_papers(args.arxiv_ids)
+        print(json.dumps(results, indent=2))
+    elif args.task == "similarity":
+        if not args.query_id:
+            print("Error: --query-id required for similarity task")
+            return
+        try:
+            redis_data = json.loads(redis_client.get(f"paper:{args.query_id}") or "{}")
+            query_embedding = redis_data.get("summarizer_output", {}).get("summary_embedding")
+            if not query_embedding:
+                print(f"Error: No summary embedding found for {args.query_id}")
+                return
+            results = similarity_search(query_embedding, [f"paper_{aid.replace('.', '_')}" for aid in args.arxiv_ids])
+            print("Top similar papers:")
+            for paper in results:
+                print(f"Paper: {paper['paper_id']}, Title: {paper['title']}, Similarity: {paper['similarity']:.4f}")
+        except Exception as e:
+            print(f"Error in similarity search: {str(e)}")
+
 if __name__ == "__main__":
-    arxiv_ids = ["1606.00915", "1706.05587"]
-    results = process_multiple_papers(arxiv_ids)
-    for result in results:
-        print(result)
+    main()
