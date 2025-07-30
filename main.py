@@ -409,6 +409,17 @@ def planner_agent(state: PlannerState) -> PlannerState:
     logging.info(f"Planner assigned task: {current_task.get('task', 'None')}")
     return {**state, "tasks": tasks, "completed_tasks": completed_tasks, "current_task": current_task}
 
+
+def router(state: PlannerState) -> str:
+    """Router to determine next node based on current task."""
+    current_task = state.get('current_task', {})
+    if not current_task:
+        return END
+    agent = current_task.get('assigned_agent', '')
+    if agent in ['fetcher', 'reader', 'analyst', 'summarizer']:
+        return agent
+    return END
+
 def process_multiple_papers(arxiv_ids: List[str], goal: str) -> List[Dict]:
     """Process multiple papers with Planner Agent."""
     results = []
@@ -473,22 +484,29 @@ graph.add_node("reader", reader_agent)
 graph.add_node("analyst", analyst_agent)
 graph.add_node("summarizer", summarizer_agent)
 graph.set_entry_point("planner")
-graph.add_edge("fetcher", "reader")
-graph.add_edge("reader", "analyst")
-graph.add_edge("analyst", "summarizer")
-graph.add_edge("summarizer", END)
+graph.add_conditional_edges("planner", router, {
+    "fetcher": "fetcher",
+    "reader": "reader",
+    "analyst": "analyst",
+    "summarizer": "summarizer",
+    END: END
+})
+graph.add_edge("fetcher", "planner")
+graph.add_edge("reader", "planner")
+graph.add_edge("analyst", "planner")
 
 app = graph.compile()
 
 def main():
-    parser = argparse.ArgumentParser(description="Research Team Simulator")
+    parser = argparse.ArgumentParser(description="Research Team Simulator with Planner")
     parser.add_argument("--arxiv-ids", nargs="+", default=["1606.00915"], help="List of arXiv IDs to process")
+    parser.add_argument("--goal", default="Survey recent semantic segmentation papers", help="Goal for the planner")
     parser.add_argument("--task", choices=["process", "similarity", "cluster"], default="process", help="Task to perform")
     parser.add_argument("--query-id", help="Paper ID for similarity search (e.g., paper_1606_00915)")
     args = parser.parse_args()
     
     if args.task == "process":
-        results = process_multiple_papers(args.arxiv_ids)
+        results = process_multiple_papers(args.arxiv_ids, args.goal)
         print(json.dumps(results, indent=2))
     elif args.task == "similarity":
         if not args.query_id:
@@ -508,14 +526,13 @@ def main():
             print(f"Error in similarity search: {str(e)}")
     elif args.task == "cluster":
         if not args.query_id:
-            print("Error: --query-id required for similarity task")
+            print("Error: --query-id required for cluster task")
             return
         try:
             print("Enter cluster size:")
             num_clusters = int(input())
-            results = cluster_papers(args.query_id, num_clusters)
-            for i in range(num_clusters):
-                print(results[i])
+            results = cluster_papers([f"paper_{aid.replace('.', '_')}" for aid in args.arxiv_ids], num_clusters)
+            print(json.dumps(results, indent=2))
         except Exception as e:
             print(f"Error in clustering: {str(e)}")
 
