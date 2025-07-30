@@ -18,6 +18,7 @@ import numpy as np
 from scipy.spatial.distance import cosine
 import argparse
 from sklearn.cluster import KMeans
+from pydantic import BaseModel, Field
 
 logging.basicConfig(filename='pipeline.log', level=logging.INFO)
 
@@ -27,6 +28,24 @@ embedder = SentenceTransformer('all-MiniLM-L6-v2')
 
 load_dotenv()
 os.environ["OPENAI_API_KEY"]=os.getenv("OPENAI_API_KEY")
+
+class Task(BaseModel):
+    task: str = Field(description="Description of the task")
+    status: str = Field(description="Task status: pending, in_progress, done, failed")
+    assigned_agent: str = Field(description="Agent responsible for the task")
+    dependencies: List[str] = Field(description="Tasks that must be completed before this task", default=[])
+    output_key: str = Field(description="Key in AgentState to store task output")
+
+class PlannerState(TypedDict):
+    goal: str
+    tasks: List[Dict]
+    completed_tasks: List[Dict]
+    current_task: Dict
+    error: str
+
+class TaskBreakdown(BaseModel):
+    tasks: List[Task] = Field(description="List of tasks to achieve the goal")
+
 class AgentState(TypedDict):
     paper_id: str
     arxiv_id: str
@@ -309,13 +328,101 @@ def summarizer_agent(state: AgentState) -> AgentState:
         logging.error(f"Error summarizing {paper_id}: {str(e)}")
         return {**state, "error": str(e)}
 
+def planner_agent(state: PlannerState) -> PlannerState:
+    """Planner agent to decompose goals into tasks and manage execution with reflexion."""
+    goal = state['goal']
+    paper_id = f"paper_{state['arxiv_id'].replace('.', '_')}"
 
-def process_multiple_papers(arxiv_ids: List[str]) -> List[Dict]:
-    """Process multiple papers in sequence."""
+    if state['tasks']:
+        prompt = ChatPromptTemplate([
+            SystemMessage(
+                content="""You are a Planner Agent. Given a user goal related to academic paper analysis, break it into specific, actionable tasks. Assign each task to an agent (fetcher, reader, analyst, summarizer) and specify dependencies and output keys. Return the tasks in the required format."""
+            ),
+            HumanMessage(content=f"Goal: {goal}")
+        ])
+
+        chain = prompt | llm.with_structured_output(TaskBreakdown)
+        task_breakdown = chain.invoke({"goal": goal})
+
+        tasks = [
+            {
+                "task": task.task,
+                "status": task.status,
+                "assigned_agent": task.assigned_agent,
+                "dependencies": task.dependencies,
+                "output_key": task.output_key
+            } for task in task_breakdown.tasks
+        ]
+
+        redis_client.set(f"planner:{paper_id}", json.dumps({
+            "goal": goal,
+            "tasks": tasks,
+            "completed_tasks": [],
+            "current_task": {}
+        }))
+
+        logging.info(f"Decomposed goal '{goal}' into {len(tasks)} tasks")
+        return {**state, "tasks": tasks, "completed_tasks": [], "current_task": {}}
+    
+    tasks = state['tasks']
+    completed_tasks = state['completed_tasks']
+    current_task = state.get('current_task', {})
+
+    if current_task and current_task['status'] == "done":
+        redis_data = json.loads(redis_client.get(f"paper:{paper_id}") or "{}")
+        output_key = current_task['output_key']
+        output = redis_data.get(output_key, {})
+        
+        if not output:
+            logging.warning(f"Task {current_task['task']} failed validation: no output")
+            current_task['status'] = "failed"
+            tasks = [t if t['task'] != current_task['task'] else current_task for t in tasks]
+            redis_client.set(f"planner:{paper_id}", json.dumps({
+                "goal": goal,
+                "tasks": tasks,
+                "completed_tasks": completed_tasks,
+                "current_task": {}
+            }))
+            return {**state, "tasks": tasks, "error": f"Task {current_task['task']} failed validation"}
+        
+        completed_tasks.append(current_task)
+        tasks = [t for t in tasks if t['task'] != current_task['task']]
+        current_task = {}
+
+    for task in tasks:
+        if task['status'] == "pending" and all(dep in [ct['task'] for ct in completed_tasks] for dep in task['dependencies']):
+            task['status'] = "in_progress"
+            current_task = task
+            break
+        
+    if not current_task and not tasks:
+        logging.info(f"All tasks completed for goal: {goal}")
+        return {**state, "tasks": [], "completed_tasks": completed_tasks, "current_task": {}, "error": ""}
+    
+    redis_client.set(f"planner:{paper_id}", json.dumps({
+        "goal": goal,
+        "tasks": tasks,
+        "completed_tasks": completed_tasks,
+        "current_task": current_task
+    }))
+
+    logging.info(f"Planner assigned task: {current_task.get('task', 'None')}")
+    return {**state, "tasks": tasks, "completed_tasks": completed_tasks, "current_task": current_task}
+
+def process_multiple_papers(arxiv_ids: List[str], goal: str) -> List[Dict]:
+    """Process multiple papers with Planner Agent."""
     results = []
     for arxiv_id in arxiv_ids:
         paper_id = f"paper_{arxiv_id.replace('.', '_')}"
-        initial_state: AgentState = {
+        planner_state: PlannerState = {
+            "goal": goal,
+            "tasks": [],
+            "completed_tasks": [],
+            "current_task": {},
+            "error": ""
+        }
+        
+        agent_state: AgentState = {
             "paper_id": paper_id,
             "arxiv_id": arxiv_id,
             "fetcher_output": {},
@@ -324,18 +431,48 @@ def process_multiple_papers(arxiv_ids: List[str]) -> List[Dict]:
             "summarizer_output": {},
             "error": ""
         }
-        result = app.invoke(initial_state)
-        results.append(result["summarizer_output"]["summary"])
-        logging.info(f"Completed processing for arXiv ID: {arxiv_id}")
+        
+        while planner_state['tasks'] or planner_state['current_task']:
+            planner_state = planner_agent(planner_state)
+            if planner_state['error']:
+                results.append({"paper_id": paper_id, "error": planner_state['error']})
+                break
+            
+            if planner_state['current_task']:
+                agent = planner_state['current_task']['assigned_agent']
+                if agent == 'fetcher':
+                    agent_state = fetcher_agent(agent_state)
+                elif agent == 'reader':
+                    agent_state = reader_agent(agent_state)
+                elif agent == 'analyst':
+                    agent_state = analyst_agent(agent_state)
+                elif agent == 'summarizer':
+                    agent_state = summarizer_agent(agent_state)
+                
+                if agent_state['error']:
+                    planner_state['error'] = agent_state['error']
+                    results.append({"paper_id": paper_id, "error": agent_state['error']})
+                    break
+                
+                # Mark task as done
+                planner_state['current_task']['status'] = "done"
+            
+            redis_client.set(f"planner:{paper_id}", json.dumps(planner_state))
+        
+        if not planner_state['error']:
+            results.append(agent_state["summarizer_output"])
+            logging.info(f"Completed processing for arXiv ID: {arxiv_id}")
+    
     return results
 
 graph = StateGraph(AgentState)
 
+graph.add_node("planner", planner_agent)
 graph.add_node("fetcher", fetcher_agent)
 graph.add_node("reader", reader_agent)
 graph.add_node("analyst", analyst_agent)
 graph.add_node("summarizer", summarizer_agent)
-graph.set_entry_point("fetcher")
+graph.set_entry_point("planner")
 graph.add_edge("fetcher", "reader")
 graph.add_edge("reader", "analyst")
 graph.add_edge("analyst", "summarizer")
