@@ -35,9 +35,11 @@ class Task(BaseModel):
     assigned_agent: str = Field(description="Agent responsible for the task")
     dependencies: List[str] = Field(description="Tasks that must be completed before this task", default=[])
     output_key: str = Field(description="Key in AgentState to store task output")
+    arxiv_id: str = Field(description="arXiv ID associated with the task", default="")
 
 class PlannerState(TypedDict):
     goal: str
+    arxiv_ids: List[str]
     tasks: List[Dict]
     completed_tasks: List[Dict]
     current_task: Dict
@@ -142,6 +144,25 @@ def cluster_papers(paper_ids: List[str], n_clusters: int = 3):
     kmeans = KMeans(n_clusters=n_clusters, random_state=42)
     labels = kmeans.fit_predict(np.array(embeddings))
     return {i: [pid for pid, lbl in zip(paper_ids, labels) if lbl == i] for i in range(n_clusters)}
+
+
+def search_arxiv(goal: str, max_results: int = 5) -> List[str]:
+    """Search arXiv for papers relevant to the goal."""
+    try:
+        client = arxiv.Client(page_size=max_results, delay_seconds=3, num_retries=3)
+        query = goal.lower().replace("survey", "").strip()
+        search = arxiv.Search(
+            query=query,
+            max_results=max_results,
+            sort_by=arxiv.SortCriterion.SubmittedDate,
+            sort_order=arxiv.SortOrder.Descending
+        )
+        arxiv_ids = [paper.entry_id.split('/')[-1] for paper in client.results(search)]
+        logging.info(f"Found {len(arxiv_ids)} papers for goal: {goal}")
+        return arxiv_ids
+    except Exception as e:
+        logging.error(f"Error searching arXiv for {goal}: {str(e)}")
+        return []
 
 def fetcher_agent(state: AgentState) -> AgentState:
     """Fetcher agent to retrieve paper metadata and PDF from ArXiv API."""
@@ -329,46 +350,56 @@ def summarizer_agent(state: AgentState) -> AgentState:
         return {**state, "error": str(e)}
 
 def planner_agent(state: PlannerState) -> PlannerState:
-    """Planner agent to decompose goals into tasks and manage execution with reflexion."""
+    """Planner agent to decompose goals into tasks, manage execution with reflexion, and search for arXiv IDs."""
     goal = state['goal']
-    paper_id = f"paper_{state['arxiv_id'].replace('.', '_')}"
-
-    if state['tasks']:
-        prompt = ChatPromptTemplate([
-            SystemMessage(
-                content="""You are a Planner Agent. Given a user goal related to academic paper analysis, break it into specific, actionable tasks. Assign each task to an agent (fetcher, reader, analyst, summarizer) and specify dependencies and output keys. Return the tasks in the required format."""
-            ),
-            HumanMessage(content=f"Goal: {goal}")
+    
+    arxiv_ids = state.get('arxiv_ids', [])
+    if not arxiv_ids:
+        arxiv_ids = search_arxiv(goal)
+        if not arxiv_ids:
+            logging.error(f"No arXiv IDs found for goal: {goal}")
+            return {**state, "error": f"No relevant papers found for goal: {goal}"}
+        state['arxiv_ids'] = arxiv_ids
+        redis_client.set(f"planner:search:{goal}", json.dumps({"arxiv_ids": arxiv_ids}))
+        logging.info(f"Stored {len(arxiv_ids)} arXiv IDs for goal: {goal}")
+    
+    tasks = state.get('tasks', [])
+    if not tasks:
+        prompt = ChatPromptTemplate.from_messages([
+            SystemMessage(content="""You are a Planner Agent. Given a user goal related to academic paper analysis and a list of arXiv IDs, break the goal into specific, actionable tasks for each paper. Assign each task to an agent (fetcher, reader, analyst, summarizer) and specify dependencies, output keys, and associate the arXiv ID. Return the tasks in the required format."""),
+            HumanMessage(content=f"Goal: {goal}\narXiv IDs: {', '.join(arxiv_ids)}")
         ])
-
+        
         chain = prompt | llm.with_structured_output(TaskBreakdown)
-        task_breakdown = chain.invoke({"goal": goal})
-
+        task_breakdown = chain.invoke({"goal": goal, "arxiv_ids": arxiv_ids})
+        
         tasks = [
             {
                 "task": task.task,
                 "status": task.status,
                 "assigned_agent": task.assigned_agent,
                 "dependencies": task.dependencies,
-                "output_key": task.output_key
+                "output_key": task.output_key,
+                "arxiv_id": task.arxiv_id
             } for task in task_breakdown.tasks
         ]
-
-        redis_client.set(f"planner:{paper_id}", json.dumps({
+        
+        redis_client.set(f"planner:global", json.dumps({
             "goal": goal,
+            "arxiv_ids": arxiv_ids,
             "tasks": tasks,
             "completed_tasks": [],
             "current_task": {}
         }))
-
-        logging.info(f"Decomposed goal '{goal}' into {len(tasks)} tasks")
-        return {**state, "tasks": tasks, "completed_tasks": [], "current_task": {}}
+        
+        logging.info(f"Decomposed goal '{goal}' into {len(tasks)} tasks for {len(arxiv_ids)} papers")
+        return {**state, "arxiv_ids": arxiv_ids, "tasks": tasks, "completed_tasks": [], "current_task": {}}
     
-    tasks = state['tasks']
     completed_tasks = state['completed_tasks']
     current_task = state.get('current_task', {})
-
+    
     if current_task and current_task['status'] == "done":
+        paper_id = f"paper_{current_task['arxiv_id'].replace('.', '_')}"
         redis_data = json.loads(redis_client.get(f"paper:{paper_id}") or "{}")
         output_key = current_task['output_key']
         output = redis_data.get(output_key, {})
@@ -377,8 +408,9 @@ def planner_agent(state: PlannerState) -> PlannerState:
             logging.warning(f"Task {current_task['task']} failed validation: no output")
             current_task['status'] = "failed"
             tasks = [t if t['task'] != current_task['task'] else current_task for t in tasks]
-            redis_client.set(f"planner:{paper_id}", json.dumps({
+            redis_client.set(f"planner:global", json.dumps({
                 "goal": goal,
+                "arxiv_ids": arxiv_ids,
                 "tasks": tasks,
                 "completed_tasks": completed_tasks,
                 "current_task": {}
@@ -388,24 +420,25 @@ def planner_agent(state: PlannerState) -> PlannerState:
         completed_tasks.append(current_task)
         tasks = [t for t in tasks if t['task'] != current_task['task']]
         current_task = {}
-
+    
     for task in tasks:
         if task['status'] == "pending" and all(dep in [ct['task'] for ct in completed_tasks] for dep in task['dependencies']):
             task['status'] = "in_progress"
             current_task = task
             break
-        
+    
     if not current_task and not tasks:
         logging.info(f"All tasks completed for goal: {goal}")
         return {**state, "tasks": [], "completed_tasks": completed_tasks, "current_task": {}, "error": ""}
     
-    redis_client.set(f"planner:{paper_id}", json.dumps({
+    redis_client.set(f"planner:global", json.dumps({
         "goal": goal,
+        "arxiv_ids": arxiv_ids,
         "tasks": tasks,
         "completed_tasks": completed_tasks,
         "current_task": current_task
     }))
-
+    
     logging.info(f"Planner assigned task: {current_task.get('task', 'None')}")
     return {**state, "tasks": tasks, "completed_tasks": completed_tasks, "current_task": current_task}
 
@@ -420,19 +453,32 @@ def router(state: PlannerState) -> str:
         return agent
     return END
 
-def process_multiple_papers(arxiv_ids: List[str], goal: str) -> List[Dict]:
-    """Process multiple papers with Planner Agent."""
+def process_multiple_papers(goal: str, arxiv_ids: List[str] = None) -> List[Dict]:
+    """Process papers with Planner Agent, using provided or searched arXiv IDs."""
     results = []
+    arxiv_ids = arxiv_ids or []
+    
+    # Initialize PlannerState to get arXiv IDs and tasks
+    planner_state: PlannerState = {
+        "goal": goal,
+        "arxiv_ids": arxiv_ids,
+        "tasks": [],
+        "completed_tasks": [],
+        "current_task": {},
+        "error": ""
+    }
+    
+    # Run planner to generate arXiv IDs and tasks
+    planner_state = planner_agent(planner_state)
+    if planner_state['error']:
+        logging.error(f"Failed to process papers: {planner_state['error']}")
+        return [{"error": planner_state['error']}]
+    
+    arxiv_ids = planner_state['arxiv_ids']
+    all_tasks = planner_state['tasks']  # Store full task list
+
     for arxiv_id in arxiv_ids:
         paper_id = f"paper_{arxiv_id.replace('.', '_')}"
-        planner_state: PlannerState = {
-            "goal": goal,
-            "tasks": [],
-            "completed_tasks": [],
-            "current_task": {},
-            "error": ""
-        }
-        
         agent_state: AgentState = {
             "paper_id": paper_id,
             "arxiv_id": arxiv_id,
@@ -443,14 +489,25 @@ def process_multiple_papers(arxiv_ids: List[str], goal: str) -> List[Dict]:
             "error": ""
         }
         
-        while planner_state['tasks'] or planner_state['current_task']:
-            planner_state = planner_agent(planner_state)
-            if planner_state['error']:
-                results.append({"paper_id": paper_id, "error": planner_state['error']})
+        # Create a local planner state for this paper
+        local_planner_state: PlannerState = {
+            "goal": goal,
+            "arxiv_ids": [arxiv_id],
+            "tasks": [t for t in all_tasks if t['arxiv_id'] == arxiv_id],
+            "completed_tasks": [],
+            "current_task": {},
+            "error": ""
+        }
+        
+        # Process tasks for this paper
+        while local_planner_state['tasks'] or local_planner_state['current_task']:
+            local_planner_state = planner_agent(local_planner_state)
+            if local_planner_state['error']:
+                results.append({"paper_id": paper_id, "error": local_planner_state['error']})
                 break
             
-            if planner_state['current_task']:
-                agent = planner_state['current_task']['assigned_agent']
+            if local_planner_state['current_task']:
+                agent = local_planner_state['current_task']['assigned_agent']
                 if agent == 'fetcher':
                     agent_state = fetcher_agent(agent_state)
                 elif agent == 'reader':
@@ -461,18 +518,30 @@ def process_multiple_papers(arxiv_ids: List[str], goal: str) -> List[Dict]:
                     agent_state = summarizer_agent(agent_state)
                 
                 if agent_state['error']:
-                    planner_state['error'] = agent_state['error']
+                    local_planner_state['error'] = agent_state['error']
                     results.append({"paper_id": paper_id, "error": agent_state['error']})
                     break
                 
-                # Mark task as done
-                planner_state['current_task']['status'] = "done"
-            
-            redis_client.set(f"planner:{paper_id}", json.dumps(planner_state))
+                # Update task status in all_tasks
+                current_task = local_planner_state['current_task']
+                current_task['status'] = "done"
+                all_tasks = [t if t['task'] != current_task['task'] else current_task for t in all_tasks]
+                local_planner_state['completed_tasks'].append(current_task)
+                local_planner_state['tasks'] = [t for t in local_planner_state['tasks'] if t['task'] != current_task['task']]
+                local_planner_state['current_task'] = {}
         
-        if not planner_state['error']:
+        if not local_planner_state['error']:
             results.append(agent_state["summarizer_output"])
             logging.info(f"Completed processing for arXiv ID: {arxiv_id}")
+    
+    # Optionally save final state to Redis for persistence
+    redis_client.set(f"planner:global", json.dumps({
+        "goal": goal,
+        "arxiv_ids": arxiv_ids,
+        "tasks": [t for t in all_tasks if t['status'] != "done"],
+        "completed_tasks": [t for t in all_tasks if t['status'] == "done"],
+        "current_task": {}
+    }))
     
     return results
 
@@ -499,14 +568,14 @@ app = graph.compile()
 
 def main():
     parser = argparse.ArgumentParser(description="Research Team Simulator with Planner")
-    parser.add_argument("--arxiv-ids", nargs="+", default=["1606.00915"], help="List of arXiv IDs to process")
-    parser.add_argument("--goal", default="Survey recent semantic segmentation papers", help="Goal for the planner")
+    parser.add_argument("--goal", default="Semantic segmentation papers", help="Goal for the planner")
+    parser.add_argument("--arxiv-ids", nargs="*", default=[], help="Optional list of arXiv IDs to process")
     parser.add_argument("--task", choices=["process", "similarity", "cluster"], default="process", help="Task to perform")
     parser.add_argument("--query-id", help="Paper ID for similarity search (e.g., paper_1606_00915)")
     args = parser.parse_args()
     
     if args.task == "process":
-        results = process_multiple_papers(args.arxiv_ids, args.goal)
+        results = process_multiple_papers(args.goal, args.arxiv_ids)
         print(json.dumps(results, indent=2))
     elif args.task == "similarity":
         if not args.query_id:
@@ -518,7 +587,8 @@ def main():
             if not query_embedding:
                 print(f"Error: No summary embedding found for {args.query_id}")
                 return
-            results = similarity_search(query_embedding, [f"paper_{aid.replace('.', '_')}" for aid in args.arxiv_ids])
+            paper_ids = [f"paper_{aid.replace('.', '_')}" for aid in args.arxiv_ids] if args.arxiv_ids else [k.split(':')[1] for k in redis_client.keys("paper:*")]
+            results = similarity_search(query_embedding, paper_ids)
             print("Top similar papers:")
             for paper in results:
                 print(f"Paper: {paper['paper_id']}, Title: {paper['title']}, Similarity: {paper['similarity']:.4f}")
@@ -531,7 +601,8 @@ def main():
         try:
             print("Enter cluster size:")
             num_clusters = int(input())
-            results = cluster_papers([f"paper_{aid.replace('.', '_')}" for aid in args.arxiv_ids], num_clusters)
+            paper_ids = [f"paper_{aid.replace('.', '_')}" for aid in args.arxiv_ids] if args.arxiv_ids else [k.split(':')[1] for k in redis_client.keys("paper:*")]
+            results = cluster_papers(paper_ids, num_clusters)
             print(json.dumps(results, indent=2))
         except Exception as e:
             print(f"Error in clustering: {str(e)}")
