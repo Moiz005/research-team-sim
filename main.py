@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 import numpy as np
 from scipy.spatial.distance import cosine
 import argparse
+from sklearn.cluster import KMeans
 
 logging.basicConfig(filename='pipeline.log', level=logging.INFO)
 
@@ -114,9 +115,14 @@ def similarity_search(query_embedding: List[float], paper_ids: List[str], embedd
         except Exception as e:
             logging.error(f"Error in similarity search for {paper_id}: {str(e)}")
     
-    # Sort by similarity (descending)
     results.sort(key=lambda x: x["similarity"], reverse=True)
-    return results[:5]  # Return top-5 results
+    return results[:5]
+
+def cluster_papers(paper_ids: List[str], n_clusters: int = 3):
+    embeddings = [json.loads(redis_client.get(f"paper:{pid}"))["summarizer_output"]["summary_embedding"] for pid in paper_ids]
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+    labels = kmeans.fit_predict(np.array(embeddings))
+    return {i: [pid for pid, lbl in zip(paper_ids, labels) if lbl == i] for i in range(n_clusters)}
 
 def fetcher_agent(state: AgentState) -> AgentState:
     """Fetcher agent to retrieve paper metadata and PDF from ArXiv API."""
@@ -340,7 +346,7 @@ app = graph.compile()
 def main():
     parser = argparse.ArgumentParser(description="Research Team Simulator")
     parser.add_argument("--arxiv-ids", nargs="+", default=["1606.00915"], help="List of arXiv IDs to process")
-    parser.add_argument("--task", choices=["process", "similarity"], default="process", help="Task to perform")
+    parser.add_argument("--task", choices=["process", "similarity", "cluster"], default="process", help="Task to perform")
     parser.add_argument("--query-id", help="Paper ID for similarity search (e.g., paper_1606_00915)")
     args = parser.parse_args()
     
@@ -363,6 +369,18 @@ def main():
                 print(f"Paper: {paper['paper_id']}, Title: {paper['title']}, Similarity: {paper['similarity']:.4f}")
         except Exception as e:
             print(f"Error in similarity search: {str(e)}")
+    elif args.task == "cluster":
+        if not args.query_id:
+            print("Error: --query-id required for similarity task")
+            return
+        try:
+            print("Enter cluster size:")
+            num_clusters = int(input())
+            results = cluster_papers(args.query_id, num_clusters)
+            for i in range(num_clusters):
+                print(results[i])
+        except Exception as e:
+            print(f"Error in clustering: {str(e)}")
 
 if __name__ == "__main__":
     main()
