@@ -489,7 +489,6 @@ def process_multiple_papers(goal: str, arxiv_ids: List[str] = None) -> List[Dict
             "error": ""
         }
         
-        # Create a local planner state for this paper
         local_planner_state: PlannerState = {
             "goal": goal,
             "arxiv_ids": [arxiv_id],
@@ -499,7 +498,6 @@ def process_multiple_papers(goal: str, arxiv_ids: List[str] = None) -> List[Dict
             "error": ""
         }
         
-        # Process tasks for this paper
         while local_planner_state['tasks'] or local_planner_state['current_task']:
             local_planner_state = planner_agent(local_planner_state)
             if local_planner_state['error']:
@@ -522,7 +520,6 @@ def process_multiple_papers(goal: str, arxiv_ids: List[str] = None) -> List[Dict
                     results.append({"paper_id": paper_id, "error": agent_state['error']})
                     break
                 
-                # Update task status in all_tasks
                 current_task = local_planner_state['current_task']
                 current_task['status'] = "done"
                 all_tasks = [t if t['task'] != current_task['task'] else current_task for t in all_tasks]
