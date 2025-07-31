@@ -73,22 +73,20 @@ def llm_jargon_explanation(keyword: str) -> str:
 
     Term: {keyword}
     """
-    return llm.invoke(LLM_PROMPT)
+    response = llm.invoke(LLM_PROMPT).content
+    return response
 
-summarizer_prompt = ChatPromptTemplate([
-    SystemMessage(
-        content="""Summarize the following academic paper in 100-200 words for a general audience. Include the provided keywords with their explanations in parentheses. Focus on clarity, brevity, and key contributions. Use the paper's metadata for context.
-
-        Return the summary only, no additional text."""
-    ),
-    HumanMessage(
-        content=(
-            "Title: {title}\n"
-            "Abstract: {abstract}\n"
-            "Full Text: {text}\n"
-            "Keywords: {keywords}"
-        )
-    )
+summarizer_prompt = ChatPromptTemplate.from_messages([
+    ("system", """Summarize the following academic paper in 100-200 words for a general audience. Include the provided keywords with their explanations in parentheses. Focus on clarity, brevity, and key contributions. Use the paper's metadata for context.
+    The details will be provided in the user message.
+    
+    Return the summary only, no additional text."""),
+    ("human", """
+    Title: {title}
+    Abstract: {abstract}
+    Full Text: {text}
+    Keywords: {keywords}
+    """)
 ])
 
 def llm_summary_generator(text: str, keywords: list, metadata: dict) -> str:
@@ -149,7 +147,6 @@ def cluster_papers(paper_ids: List[str], n_clusters: int = 3):
 def search_arxiv(goal: str, max_results: int = 2) -> List[str]:
     """Search arXiv for papers relevant to the goal."""
     try:
-        print(f"Searching Papers for goal: {goal}")
         client = arxiv.Client(page_size=max_results, delay_seconds=3, num_retries=3)
         query = goal.lower().replace("survey", "").strip()
         search = arxiv.Search(
@@ -160,7 +157,6 @@ def search_arxiv(goal: str, max_results: int = 2) -> List[str]:
         )
         arxiv_ids = [paper.entry_id.split('/')[-1] for paper in client.results(search)]
         logging.info(f"Found {len(arxiv_ids)} papers for goal: {goal}")
-        print("Searching completed")
         return arxiv_ids
     except Exception as e:
         logging.error(f"Error searching arXiv for {goal}: {str(e)}")
@@ -168,7 +164,6 @@ def search_arxiv(goal: str, max_results: int = 2) -> List[str]:
 
 def fetcher_agent(state: AgentState) -> AgentState:
     """Fetcher agent to retrieve paper metadata and PDF from ArXiv API."""
-    print("Running Fetcher Agent")
     arxiv_id = state['arxiv_id']
     paper_id = state['paper_id']
 
@@ -215,7 +210,6 @@ def fetcher_agent(state: AgentState) -> AgentState:
 
 def reader_agent(state: AgentState) -> AgentState:
     """Reader agent to process PDF and extract text/metadata."""
-    print("Running Reader Agent")
     fetcher_output = state['fetcher_output']
     paper_id = state['paper_id']
 
@@ -262,7 +256,6 @@ def reader_agent(state: AgentState) -> AgentState:
 
 def analyst_agent(state: AgentState) -> AgentState:
     """Analyst agent to extract keywords and handle jargon."""
-    print("Running Analyst Agent")
     reader_output = state["reader_output"]
     paper_id = state["paper_id"]
     if state['error']:
@@ -284,8 +277,6 @@ def analyst_agent(state: AgentState) -> AgentState:
         for keyword, embedding in zip(keywords, keyword_embeddings):
             keyword_clean = keyword.lower().strip()
             explanation = llm_jargon_explanation(keyword_clean)
-            if len(explanation) > 100 or explanation == "no explanation available":
-                explanation = "no clear explanation available"
             enriched_keywords.append({
                 "keyword": keyword,
                 "explanation": explanation,
@@ -298,7 +289,7 @@ def analyst_agent(state: AgentState) -> AgentState:
         }
 
         redis_data = json.loads(redis_client.get(f"paper:{paper_id}"))
-        redis_data.update("analyst_output", analyst_output)
+        redis_data.update({"analyst_output": analyst_output})
         redis_client.set(f"paper:{paper_id}", json.dumps(redis_data))
 
         logging.info(f"Analyzed {paper_id}, keywords: {len(enriched_keywords)}")
@@ -311,7 +302,6 @@ def analyst_agent(state: AgentState) -> AgentState:
 
 def summarizer_agent(state: AgentState) -> AgentState:
     """Summarizer agent with LLM for dynamic summary generation."""
-    print("Running Summarizer Agent")
     reader_output = state['reader_output']
     analyst_output = state['analyst_output']
     paper_id = state["paper_id"]
@@ -330,8 +320,7 @@ def summarizer_agent(state: AgentState) -> AgentState:
     
     try:
         summary = llm_summary_generator(text, keywords, metadata)
-
-        if len(summary) < 50 or len(summary) > 500:
+        if len(summary) < 50:
             logging.warning(f"Invalid summary length for {paper_id}: {len(summary)} chars")
             summary = "Summary generation failed: invalid length"
         
@@ -344,7 +333,7 @@ def summarizer_agent(state: AgentState) -> AgentState:
         }
 
         redis_data = json.loads(redis_client.get(f"paper:{paper_id}") or "{}")
-        redis_data.update("summarizer_output", summarizer_output)
+        redis_data.update({"summarizer_output": summarizer_output})
         redis_client.set(f"paper:{paper_id}", json.dumps(redis_data))
 
         logging.info(f"Summarized {paper_id}, summary length: {len(summary)} chars")
@@ -358,7 +347,6 @@ def summarizer_agent(state: AgentState) -> AgentState:
 def planner_agent(state: PlannerState) -> PlannerState:
     """Planner agent to decompose goals into tasks, manage execution with reflexion, and search for arXiv IDs."""
     goal = state['goal']
-    print("Running Planner Agent")
     arxiv_ids = state.get('arxiv_ids', [])
     if not arxiv_ids:
         arxiv_ids = search_arxiv(goal)
@@ -464,7 +452,6 @@ def process_multiple_papers(goal: str, arxiv_ids: List[str] = None) -> List[Dict
     results = []
     arxiv_ids = arxiv_ids or []
     
-    # Initialize PlannerState to get arXiv IDs and tasks
     planner_state: PlannerState = {
         "goal": goal,
         "arxiv_ids": arxiv_ids,
@@ -474,7 +461,6 @@ def process_multiple_papers(goal: str, arxiv_ids: List[str] = None) -> List[Dict
         "error": ""
     }
     
-    # Run planner to generate arXiv IDs and tasks
     planner_state = planner_agent(planner_state)
     if planner_state['error']:
         logging.error(f"Failed to process papers: {planner_state['error']}")
@@ -506,7 +492,6 @@ def process_multiple_papers(goal: str, arxiv_ids: List[str] = None) -> List[Dict
         
         while local_planner_state['tasks'] or local_planner_state['current_task']:
             local_planner_state = planner_agent(local_planner_state)
-            print(local_planner_state)
             if local_planner_state['error']:
                 results.append({"paper_id": paper_id, "error": local_planner_state['error']})
                 break
@@ -578,9 +563,9 @@ def main():
     args = parser.parse_args()
     
     if args.task == "process":
-        print(f"Starting process for goal: {args.goal}")
         results = process_multiple_papers(args.goal, args.arxiv_ids)
-        print(json.dumps(results, indent=2))
+        for result in results:
+            print(f"paper_id: {result['paper_id']}\nsummary: {result['summary']}")
     elif args.task == "similarity":
         if not args.query_id:
             print("Error: --query-id required for similarity task")
@@ -613,5 +598,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    # print("Deleting Database!!!")
-    # redis_client.flushdb()
