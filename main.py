@@ -33,7 +33,7 @@ class Task(BaseModel):
     task: str = Field(description="Description of the task")
     status: str = Field(description="Task status: pending, in_progress, done, failed")
     assigned_agent: str = Field(description="Agent responsible for the task")
-    dependencies: List[str] = Field(description="Tasks that must be completed before this task", default=[])
+    dependencies: List[str] = Field(description="List of exact task descriptions (from the 'task' field) of other tasks that must be completed before this task", default=[])
     output_key: str = Field(description="Key in AgentState to store task output")
     arxiv_id: str = Field(description="arXiv ID associated with the task", default="")
 
@@ -146,9 +146,10 @@ def cluster_papers(paper_ids: List[str], n_clusters: int = 3):
     return {i: [pid for pid, lbl in zip(paper_ids, labels) if lbl == i] for i in range(n_clusters)}
 
 
-def search_arxiv(goal: str, max_results: int = 5) -> List[str]:
+def search_arxiv(goal: str, max_results: int = 2) -> List[str]:
     """Search arXiv for papers relevant to the goal."""
     try:
+        print(f"Searching Papers for goal: {goal}")
         client = arxiv.Client(page_size=max_results, delay_seconds=3, num_retries=3)
         query = goal.lower().replace("survey", "").strip()
         search = arxiv.Search(
@@ -159,6 +160,7 @@ def search_arxiv(goal: str, max_results: int = 5) -> List[str]:
         )
         arxiv_ids = [paper.entry_id.split('/')[-1] for paper in client.results(search)]
         logging.info(f"Found {len(arxiv_ids)} papers for goal: {goal}")
+        print("Searching completed")
         return arxiv_ids
     except Exception as e:
         logging.error(f"Error searching arXiv for {goal}: {str(e)}")
@@ -166,6 +168,7 @@ def search_arxiv(goal: str, max_results: int = 5) -> List[str]:
 
 def fetcher_agent(state: AgentState) -> AgentState:
     """Fetcher agent to retrieve paper metadata and PDF from ArXiv API."""
+    print("Running Fetcher Agent")
     arxiv_id = state['arxiv_id']
     paper_id = state['paper_id']
 
@@ -187,7 +190,7 @@ def fetcher_agent(state: AgentState) -> AgentState:
 
         os.makedirs("papers", exist_ok=True)
         pdf_path = f"papers/{paper_id}.pdf"
-        paper.download_pdf(dir_path="./papers", filename=f"{paper_id}.pdf")
+        paper.download_pdf(dirpath="./papers", filename=f"{paper_id}.pdf")
 
         if not os.path.exists(pdf_path) or os.path.getsize(pdf_path) < 1000:
             logging.error(f"Invalid or empty PDF for {arxiv_id}")
@@ -212,6 +215,7 @@ def fetcher_agent(state: AgentState) -> AgentState:
 
 def reader_agent(state: AgentState) -> AgentState:
     """Reader agent to process PDF and extract text/metadata."""
+    print("Running Reader Agent")
     fetcher_output = state['fetcher_output']
     paper_id = state['paper_id']
 
@@ -220,8 +224,9 @@ def reader_agent(state: AgentState) -> AgentState:
         return {**state, "error": state['error']}
     
     pdf_path = state['fetcher_output']['pdf_path']
+    print(f"\n\n*********** Pdf Path: {pdf_path}***************")
     if not pdf_path or os.path.exists(pdf_path):
-        logging.error(f"Invalif pdf path for {paper_id}")
+        logging.error(f"Invalid pdf path for {paper_id}")
         return {**state, "error": f"Invalif pdf path for {paper_id}"}
     
     try:
@@ -258,6 +263,7 @@ def reader_agent(state: AgentState) -> AgentState:
 
 def analyst_agent(state: AgentState) -> AgentState:
     """Analyst agent to extract keywords and handle jargon."""
+    print("Running Analyst Agent")
     reader_output = state["reader_output"]
     paper_id = state["paper_id"]
     if state['error']:
@@ -306,6 +312,7 @@ def analyst_agent(state: AgentState) -> AgentState:
 
 def summarizer_agent(state: AgentState) -> AgentState:
     """Summarizer agent with LLM for dynamic summary generation."""
+    print("Running Summarizer Agent")
     reader_output = state['reader_output']
     analyst_output = state['analyst_output']
     paper_id = state["paper_id"]
@@ -352,7 +359,7 @@ def summarizer_agent(state: AgentState) -> AgentState:
 def planner_agent(state: PlannerState) -> PlannerState:
     """Planner agent to decompose goals into tasks, manage execution with reflexion, and search for arXiv IDs."""
     goal = state['goal']
-    
+    print("Running Planner Agent")
     arxiv_ids = state.get('arxiv_ids', [])
     if not arxiv_ids:
         arxiv_ids = search_arxiv(goal)
@@ -366,7 +373,7 @@ def planner_agent(state: PlannerState) -> PlannerState:
     tasks = state.get('tasks', [])
     if not tasks:
         prompt = ChatPromptTemplate.from_messages([
-            SystemMessage(content="""You are a Planner Agent. Given a user goal related to academic paper analysis and a list of arXiv IDs, break the goal into specific, actionable tasks for each paper. Assign each task to an agent (fetcher, reader, analyst, summarizer) and specify dependencies, output keys, and associate the arXiv ID. Return the tasks in the required format."""),
+            SystemMessage(content="""You are a Planner Agent. Given a user goal related to academic paper analysis and a list of arXiv IDs, break the goal into specific, actionable tasks for each paper. Assign each task to an agent (fetcher, reader, analyst, summarizer) and specify dependencies, output keys, and associate the arXiv ID. For the dependencies field, use the exact 'task' field values of preceding tasks that must be completed before the current task. For example, if the reader task depends on the fetcher task, set dependencies to the fetcher task's 'task' description (e.g., 'Fetch the paper with arXiv ID 1234.56789'). Return the tasks in the required format."""),
             HumanMessage(content=f"Goal: {goal}\narXiv IDs: {', '.join(arxiv_ids)}")
         ])
         
@@ -500,6 +507,7 @@ def process_multiple_papers(goal: str, arxiv_ids: List[str] = None) -> List[Dict
         
         while local_planner_state['tasks'] or local_planner_state['current_task']:
             local_planner_state = planner_agent(local_planner_state)
+            print(local_planner_state)
             if local_planner_state['error']:
                 results.append({"paper_id": paper_id, "error": local_planner_state['error']})
                 break
@@ -531,7 +539,6 @@ def process_multiple_papers(goal: str, arxiv_ids: List[str] = None) -> List[Dict
             results.append(agent_state["summarizer_output"])
             logging.info(f"Completed processing for arXiv ID: {arxiv_id}")
     
-    # Optionally save final state to Redis for persistence
     redis_client.set(f"planner:global", json.dumps({
         "goal": goal,
         "arxiv_ids": arxiv_ids,
@@ -572,6 +579,7 @@ def main():
     args = parser.parse_args()
     
     if args.task == "process":
+        print(f"Starting process for goal: {args.goal}")
         results = process_multiple_papers(args.goal, args.arxiv_ids)
         print(json.dumps(results, indent=2))
     elif args.task == "similarity":
@@ -606,3 +614,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # print("Deleting Database!!!")
+    # redis_client.flushdb()

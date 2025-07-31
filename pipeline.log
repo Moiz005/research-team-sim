@@ -1,0 +1,20 @@
+INFO:sentence_transformers.SentenceTransformer:Use pytorch device_name: cpu
+INFO:sentence_transformers.SentenceTransformer:Load pretrained SentenceTransformer: all-MiniLM-L6-v2
+INFO:arxiv:Requesting page (first: True, try: 0): https://export.arxiv.org/api/query?search_query=gans&id_list=&sortBy=submittedDate&sortOrder=descending&start=0&max_results=2
+INFO:arxiv:Got first page: 2 of 12802 total results
+INFO:root:Found 2 papers for goal: gans
+INFO:root:Stored 2 arXiv IDs for goal: gans
+INFO:httpx:HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+INFO:root:Decomposed goal 'gans' into 8 tasks for 2 papers
+INFO:root:Planner assigned task: Fetch the paper with arXiv ID 2507.22852v1
+INFO:arxiv:Requesting page (first: True, try: 0): https://export.arxiv.org/api/query?search_query=&id_list=2507.22852v1&sortBy=relevance&sortOrder=descending&start=0&max_results=1
+INFO:arxiv:Got first page: 1 of 1 total results
+INFO:root:Fetched 2507.22852v1, stored as paper:paper_2507_22852v1
+INFO:root:Planner assigned task: Read the fetched paper with arXiv ID 2507.22852v1
+ERROR:root:Invalif pdf path for paper_2507_22852v1
+INFO:root:Planner assigned task: Fetch the paper with arXiv ID 2507.22851v1
+INFO:arxiv:Requesting page (first: True, try: 0): https://export.arxiv.org/api/query?search_query=&id_list=2507.22851v1&sortBy=relevance&sortOrder=descending&start=0&max_results=1
+INFO:arxiv:Got first page: 1 of 1 total results
+INFO:root:Fetched 2507.22851v1, stored as paper:paper_2507_22851v1
+INFO:root:Planner assigned task: Read the fetched paper with arXiv ID 2507.22851v1
+ERROR:root:Invalif pdf path for paper_2507_22851v1
