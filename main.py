@@ -189,7 +189,7 @@ def fetcher_agent(state: AgentState) -> AgentState:
         }
 
         os.makedirs("papers", exist_ok=True)
-        pdf_path = f"papers/{paper_id}.pdf"
+        pdf_path = f"./papers/{paper_id}.pdf"
         paper.download_pdf(dirpath="./papers", filename=f"{paper_id}.pdf")
 
         if not os.path.exists(pdf_path) or os.path.getsize(pdf_path) < 1000:
@@ -224,10 +224,9 @@ def reader_agent(state: AgentState) -> AgentState:
         return {**state, "error": state['error']}
     
     pdf_path = state['fetcher_output']['pdf_path']
-    print(f"\n\n*********** Pdf Path: {pdf_path}***************")
-    if not pdf_path or os.path.exists(pdf_path):
+    if not pdf_path or not os.path.exists(pdf_path):
         logging.error(f"Invalid pdf path for {paper_id}")
-        return {**state, "error": f"Invalif pdf path for {paper_id}"}
+        return {**state, "error": f"Invalid pdf path for {paper_id}"}
     
     try:
         with pdfplumber.open(pdf_path) as pdf:

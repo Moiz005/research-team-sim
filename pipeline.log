@@ -10,11 +10,17 @@ INFO:root:Planner assigned task: Fetch the paper with arXiv ID 2507.22852v1
 INFO:arxiv:Requesting page (first: True, try: 0): https://export.arxiv.org/api/query?search_query=&id_list=2507.22852v1&sortBy=relevance&sortOrder=descending&start=0&max_results=1
 INFO:arxiv:Got first page: 1 of 1 total results
 INFO:root:Fetched 2507.22852v1, stored as paper:paper_2507_22852v1
-INFO:root:Planner assigned task: Read the fetched paper with arXiv ID 2507.22852v1
-ERROR:root:Invalif pdf path for paper_2507_22852v1
+INFO:root:Planner assigned task: Read the paper with arXiv ID 2507.22852v1
+INFO:root:Processed paper_2507_22852v1, text length: 152393
+INFO:root:Planner assigned task: Analyze the findings of the paper with arXiv ID 2507.22852v1
+INFO:httpx:HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+ERROR:root:Error analyzing paper_2507_22852v1: object of type 'AIMessage' has no len()
 INFO:root:Planner assigned task: Fetch the paper with arXiv ID 2507.22851v1
 INFO:arxiv:Requesting page (first: True, try: 0): https://export.arxiv.org/api/query?search_query=&id_list=2507.22851v1&sortBy=relevance&sortOrder=descending&start=0&max_results=1
 INFO:arxiv:Got first page: 1 of 1 total results
 INFO:root:Fetched 2507.22851v1, stored as paper:paper_2507_22851v1
-INFO:root:Planner assigned task: Read the fetched paper with arXiv ID 2507.22851v1
-ERROR:root:Invalif pdf path for paper_2507_22851v1
+INFO:root:Planner assigned task: Read the paper with arXiv ID 2507.22851v1
+INFO:root:Processed paper_2507_22851v1, text length: 69128
+INFO:root:Planner assigned task: Analyze the findings of the paper with arXiv ID 2507.22851v1
+INFO:httpx:HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+ERROR:root:Error analyzing paper_2507_22851v1: object of type 'AIMessage' has no len()
